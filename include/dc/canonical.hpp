@@ -159,6 +159,25 @@ class CanonicalReader {
   bool read_domain(std::string_view expected);
   bool skip(std::size_t count);
 
+  // Optional handle: the zero value is a legitimate "absent" marker for handle
+  // fields that are only populated once a record reaches a later state (a
+  // compilation with no current attempt, a worker with no live session).
+  // Peer-supplied required handles must still use read_id, which rejects zero.
+  template <class IdT>
+  bool read_optional_id(IdT& out) {
+    std::uint64_t raw = 0;
+    if (!read_u64(raw)) return false;
+    if (raw == 0) {
+      out = IdT();
+      return true;
+    }
+    if (!IdT::decode(raw, out)) {
+      fail(ErrorCode::Malformed, "optional identity handle is out of domain");
+      return false;
+    }
+    return true;
+  }
+
   bool read_id(CompilationId& out);
   bool read_id(RequestId& out);
   bool read_id(WorkerId& out);

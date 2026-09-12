@@ -34,7 +34,7 @@ void encode_registry(CanonicalWriter& w, const RegistryT& registry) {
 }
 
 template <class RegistryT, class IdT, class GenT>
-bool decode_registry(CanonicalReader& r, RegistryT& registry) {
+bool decode_registry(CanonicalReader& r, RegistryT& registry, const char* name) {
   std::uint64_t slots = 0;
   std::uint64_t entries = 0;
   if (!r.read_u64(slots)) return false;
@@ -48,7 +48,8 @@ bool decode_registry(CanonicalReader& r, RegistryT& registry) {
     if (!r.read_u64(raw_id)) return false;
     IdT id;
     if (!IdT::decode(raw_id, id)) {
-      r.fail(ErrorCode::Malformed, "registry id is zero");
+      r.fail(ErrorCode::Malformed, std::string("registry '") + name + "' entry " + std::to_string(i) +
+                                       " has a zero id at offset " + std::to_string(r.position()));
       return false;
     }
     GenT current;
@@ -194,20 +195,30 @@ Status decode_state(std::span<const std::byte> bytes, State& out) {
   }
   if (!r.read_u64(state.header.restarts)) return Status::error(ErrorCode::PersistenceCorrupt, "restarts");
 
-  const auto reject = [&r]() {
-    return Status::error(ErrorCode::PersistenceCorrupt, "state decode failed: " + r.status().detail());
+  std::string stage = "header";
+  const auto reject = [&r, &stage]() {
+    return Status::error(ErrorCode::PersistenceCorrupt,
+                         "state decode failed in " + stage + ": " + r.status().detail());
   };
 
-  if (!decode_registry<SourceRegistry, SourceId, SourceGeneration>(r, state.sources)) return reject();
-  if (!decode_registry<IRRegistry, IRId, IRGeneration>(r, state.irs)) return reject();
-  if (!decode_registry<DependencyRegistry, DependencySetId, DependencyGeneration>(r, state.dependencies)) return reject();
-  if (!decode_registry<ToolchainRegistry, ToolchainId, ToolchainGeneration>(r, state.toolchains)) return reject();
-  if (!decode_registry<TargetRegistry, TargetId, TargetGeneration>(r, state.targets)) return reject();
-  if (!decode_registry<SpecializationRegistry, SpecializationId, SpecializationGeneration>(r, state.specializations))
+  stage = "sources";
+  if (!decode_registry<SourceRegistry, SourceId, SourceGeneration>(r, state.sources, "sources")) return reject();
+  stage = "irs";
+  if (!decode_registry<IRRegistry, IRId, IRGeneration>(r, state.irs, "irs")) return reject();
+  stage = "dependencies";
+  if (!decode_registry<DependencyRegistry, DependencySetId, DependencyGeneration>(r, state.dependencies, "dependencies")) return reject();
+  stage = "toolchains";
+  if (!decode_registry<ToolchainRegistry, ToolchainId, ToolchainGeneration>(r, state.toolchains, "toolchains")) return reject();
+  stage = "targets";
+  if (!decode_registry<TargetRegistry, TargetId, TargetGeneration>(r, state.targets, "targets")) return reject();
+  stage = "specializations";
+  if (!decode_registry<SpecializationRegistry, SpecializationId, SpecializationGeneration>(r, state.specializations, "specializations"))
     return reject();
-  if (!decode_registry<PolicyRegistry, CompilePolicyId, CompilePolicyGeneration>(r, state.policies)) return reject();
+  stage = "policies";
+  if (!decode_registry<PolicyRegistry, CompilePolicyId, CompilePolicyGeneration>(r, state.policies, "policies")) return reject();
 
   std::uint64_t count = 0;
+  stage = "workers";
   if (!r.read_u64(count) || count > kMaxStateRecords) return reject();
   for (std::uint64_t i = 0; i < count; ++i) {
     WorkerRecord worker;
@@ -215,6 +226,7 @@ Status decode_state(std::span<const std::byte> bytes, State& out) {
     state.workers[worker.id] = std::move(worker);
   }
 
+  stage = "requests";
   if (!r.read_u64(count) || count > kMaxStateRecords) return reject();
   for (std::uint64_t i = 0; i < count; ++i) {
     CompilationRequest request;
@@ -222,6 +234,7 @@ Status decode_state(std::span<const std::byte> bytes, State& out) {
     state.requests[request.request_identity] = std::move(request);
   }
 
+  stage = "jobs";
   if (!r.read_u64(count) || count > kMaxStateRecords) return reject();
   for (std::uint64_t i = 0; i < count; ++i) {
     JobRecord job;
@@ -229,6 +242,7 @@ Status decode_state(std::span<const std::byte> bytes, State& out) {
     state.jobs[job.request_identity] = std::move(job);
   }
 
+  stage = "compilations";
   if (!r.read_u64(count) || count > kMaxStateRecords) return reject();
   for (std::uint64_t i = 0; i < count; ++i) {
     CompilationRecord record;
@@ -236,6 +250,7 @@ Status decode_state(std::span<const std::byte> bytes, State& out) {
     state.compilations[record.id] = std::move(record);
   }
 
+  stage = "attempts";
   if (!r.read_u64(count) || count > kMaxStateRecords) return reject();
   for (std::uint64_t i = 0; i < count; ++i) {
     CompilationAttempt attempt;
@@ -243,6 +258,7 @@ Status decode_state(std::span<const std::byte> bytes, State& out) {
     state.attempts[attempt.id] = std::move(attempt);
   }
 
+  stage = "commits";
   if (!r.read_u64(count) || count > kMaxStateRecords) return reject();
   for (std::uint64_t i = 0; i < count; ++i) {
     ArtifactCommit commit;
@@ -250,6 +266,7 @@ Status decode_state(std::span<const std::byte> bytes, State& out) {
     state.commits[commit.id] = std::move(commit);
   }
 
+  stage = "authoritative";
   if (!r.read_u64(count) || count > kMaxStateRecords) return reject();
   for (std::uint64_t i = 0; i < count; ++i) {
     CompilationId compilation;
@@ -259,6 +276,7 @@ Status decode_state(std::span<const std::byte> bytes, State& out) {
     state.authoritative[compilation] = commit;
   }
 
+  stage = "provenances";
   if (!r.read_u64(count) || count > kMaxStateRecords) return reject();
   for (std::uint64_t i = 0; i < count; ++i) {
     Provenance provenance;
@@ -266,6 +284,7 @@ Status decode_state(std::span<const std::byte> bytes, State& out) {
     state.provenances[provenance.id] = std::move(provenance);
   }
 
+  stage = "validations";
   if (!r.read_u64(count) || count > kMaxStateRecords) return reject();
   for (std::uint64_t i = 0; i < count; ++i) {
     ValidationReport report;
@@ -273,6 +292,7 @@ Status decode_state(std::span<const std::byte> bytes, State& out) {
     state.validations[report.id] = std::move(report);
   }
 
+  stage = "cache";
   if (!r.read_u64(count) || count > kMaxStateRecords) return reject();
   for (std::uint64_t i = 0; i < count; ++i) {
     CacheEntry entry;
@@ -284,6 +304,7 @@ Status decode_state(std::span<const std::byte> bytes, State& out) {
     state.cache_entries[entry.id] = std::move(entry);
   }
 
+  stage = "intermediates";
   if (!r.read_u64(count) || count > kMaxStateRecords) return reject();
   for (std::uint64_t i = 0; i < count; ++i) {
     IntermediateArtifact artifact;
@@ -291,6 +312,7 @@ Status decode_state(std::span<const std::byte> bytes, State& out) {
     state.intermediates[artifact.id] = std::move(artifact);
   }
 
+  stage = "leases";
   if (!r.read_u64(count) || count > kMaxStateRecords) return reject();
   for (std::uint64_t i = 0; i < count; ++i) {
     CompileLease lease;

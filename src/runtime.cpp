@@ -98,8 +98,11 @@ bool is_legal_transition(AttemptState from, AttemptState to) noexcept {
       return to == AttemptState::Preparing || to == AttemptState::Failed || to == AttemptState::Fenced ||
              to == AttemptState::Cancelled || to == AttemptState::Ambiguous;
     case AttemptState::Preparing:
-      return to == AttemptState::Running || to == AttemptState::Failed || to == AttemptState::Fenced ||
-             to == AttemptState::Cancelled || to == AttemptState::Ambiguous;
+      // A compile may produce its result before the Running acknowledgement is
+      // observed (very short compiles, or a fast worker), so Preparing must be
+      // able to reach Produced directly.
+      return to == AttemptState::Running || to == AttemptState::Produced || to == AttemptState::Failed ||
+             to == AttemptState::Fenced || to == AttemptState::Cancelled || to == AttemptState::Ambiguous;
     case AttemptState::Running:
       return to == AttemptState::Produced || to == AttemptState::Failed || to == AttemptState::Fenced ||
              to == AttemptState::Cancelled || to == AttemptState::Ambiguous;

@@ -10,6 +10,11 @@
 
 namespace dc {
 
+void mark_capabilities_unknown(WorkerRecord& worker) {
+  worker.capabilities.evidence = EvidenceClass::Unknown;
+  canonicalize(worker.capabilities);
+}
+
 // ---------------------------------------------------------------------------
 // Clock
 // ---------------------------------------------------------------------------
@@ -558,7 +563,7 @@ void Coordinator::Impl::fence_worker(WorkerRecord& worker, std::string reason) {
   worker.session = SessionId(0);
   worker.active_leases.clear();
   worker.trusted_evidence_fresh = false;
-  worker.capabilities.evidence = EvidenceClass::Unknown;
+  mark_capabilities_unknown(worker);
   revoke_leases_for(worker.id, reason);
 }
 
@@ -734,7 +739,7 @@ Status Coordinator::open(const CoordinatorConfig& config) {
       worker.trusted_evidence_fresh = false;
       // Toolchain evidence must be re-established by the restarted worker; a
       // pre-restart advertisement is not proof of what is on disk now.
-      worker.capabilities.evidence = EvidenceClass::Unknown;
+      mark_capabilities_unknown(worker);
     }
   }
   for (auto& kv : impl_->state.leases) {
@@ -1016,6 +1021,15 @@ std::vector<CacheEntry> Coordinator::cache_entries() const {
   out.reserve(impl_->state.cache_entries.size());
   for (const auto& kv : impl_->state.cache_entries) out.push_back(kv.second);
   return out;
+}
+
+Result<CacheEntry> Coordinator::cache_entry(CacheEntryId id) const {
+  std::lock_guard<std::mutex> guard(impl_->mutex);
+  auto found = impl_->state.cache_entries.find(id);
+  if (found == impl_->state.cache_entries.end()) {
+    return Result<CacheEntry>(Status::error(ErrorCode::NotFound, "unknown cache entry"));
+  }
+  return Result<CacheEntry>(found->second);
 }
 
 std::vector<NegativeCacheEntry> Coordinator::negative_cache_entries() const {

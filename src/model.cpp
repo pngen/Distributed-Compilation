@@ -592,6 +592,7 @@ Status canonicalize(SpecializationSpec& spec) {
       return Status::error(ErrorCode::InvalidArgument, "control character in specialization field name");
     }
   }
+  spec.id = derive_specialization_id(spec);
   spec.identity_digest = compute_specialization_identity(spec);
   return Status::success();
 }
@@ -630,6 +631,18 @@ void canonicalize(ToolchainIdentity& toolchain) {
                   [](const auto& a, const auto& b) { return a.first == b.first; }),
       toolchain.configuration.end());
   toolchain.id = derive_toolchain_id(toolchain);
+  if (toolchain.evidence_id.is_zero()) {
+    // Every toolchain carries a stable evidence handle so that provenance can
+    // point at how the identity was established.
+    toolchain.evidence_id = EvidenceId(mix64(handle_from_digest(toolchain.id.value() == 0
+                                                                    ? Digest256{}
+                                                                    : [&toolchain] {
+                                                                        Digest256 d;
+                                                                        std::memcpy(d.data(), &toolchain.id,
+                                                                                    sizeof(d));
+                                                                        return d;
+                                                                      }())));
+  }
   toolchain.identity_digest = compute_toolchain_identity(toolchain);
 }
 
@@ -863,8 +876,15 @@ void write_unit_identity_body(CanonicalWriter& w, const CompilationRequest& requ
   for (const auto& dep : unit.dependencies) write_dependency_entry(w, dep);
   write_string_list(w, unit.flags);
   write_string_list(w, request.flags);
+  // Fan-in identity binds the *identities* of the child units, not just their
+  // positions, so a link of different objects can never derive the identity of
+  // a link of different objects with the same shape.
   w.list(static_cast<std::uint32_t>(unit.child_units.size()));
-  for (std::uint32_t child : unit.child_units) w.u32(child);
+  for (std::uint32_t child : unit.child_units) {
+    w.u32(child);
+    const CompilationUnitSpec* child_unit = request.find_unit(child);
+    w.digest(child_unit != nullptr ? child_unit->identity_digest : Digest256{});
+  }
   w.boolean(unit.mandatory);
 }
 
@@ -894,7 +914,9 @@ Status canonicalize_unit(CompilationRequest& request, CompilationUnitSpec& unit)
       return Status::error(ErrorCode::Duplicate, "duplicate unit source name: " + unit.sources[i].logical_name);
     }
   }
-  if (unit.sources.empty()) {
+  // A link unit consumes child artifacts rather than source text, so it may
+  // legitimately carry no sources of its own. A compile unit may not.
+  if (unit.sources.empty() && unit.kind != UnitKind::Link) {
     return Status::error(ErrorCode::InvalidArgument, "unit '" + unit.logical_name + "' has no sources");
   }
 

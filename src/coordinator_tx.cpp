@@ -63,6 +63,15 @@ std::vector<std::byte> encode_lease_payload(const CompileLease& lease) {
 // Registry resolution and declared-generation checks
 // ---------------------------------------------------------------------------
 Status Coordinator::Impl::register_and_check(CompilationRequest& request) {
+  // A zero logical id must never become a registry key: it would make every
+  // unnamed entity collide in one slot.
+  if (request.toolchain.id.is_zero() || request.target.id.is_zero() ||
+      request.specialization.id.is_zero() || request.policy.id.is_zero() ||
+      request.dependencies.id.is_zero()) {
+    return Status::error(ErrorCode::InvalidArgument,
+                         "every registered identity must have a non-zero logical id");
+  }
+
   const auto generation_conflict = [](ErrorCode code, const char* dimension, std::uint64_t declared,
                                       std::uint64_t actual) {
     return Status::error(code, std::string(dimension) + " generation declared as " +
@@ -343,18 +352,9 @@ Result<SubmissionResult> Coordinator::submit(const SubmissionBundle& bundle) {
     submission.unit_identity = record.unit_identity;
     submission.state = record.state;
 
-    if (record.state == CompilationState::Committed && !bundle.force_rebuild) {
-      submission.committed = true;
-      auto commit = impl_->state.authoritative.find(record.id);
-      if (commit != impl_->state.authoritative.end()) {
-        auto found = impl_->state.commits.find(commit->second);
-        if (found != impl_->state.commits.end()) submission.commit = found->second;
-      }
-      submission.detail = "already committed at this generation";
-      result.units.push_back(std::move(submission));
-      continue;
-    }
-
+    // Cache consultation comes first: an identical resubmission must travel the
+    // validated-reuse path rather than short-circuiting on the commit record,
+    // because that path is the one that re-proves every identity dimension.
     if (request.policy.cache != CachePolicy::Bypass) {
       auto index = impl_->state.cache_index.find(record.unit_identity);
       if (index == impl_->state.cache_index.end()) {
@@ -373,7 +373,10 @@ Result<SubmissionResult> Coordinator::submit(const SubmissionBundle& bundle) {
           }
           submission.cache = decision;
           if (decision.reusable()) {
-            record.state = CompilationState::CacheHit;
+            // A compilation that already holds an authoritative commit stays
+            // Committed; the cache hit is recorded as the reuse path.
+            record.state = impl_->state.authoritative.count(record.id) != 0 ? CompilationState::Committed
+                                                                            : CompilationState::CacheHit;
             record.cache_hit = true;
             record.updated_at = impl_->now();
             submission.state = record.state;
@@ -394,6 +397,19 @@ Result<SubmissionResult> Coordinator::submit(const SubmissionBundle& bundle) {
     } else {
       submission.cache.outcome = CacheOutcome::Miss;
       submission.cache.reason = "cache policy is BYPASS";
+    }
+
+    if (record.state == CompilationState::Committed && !bundle.force_rebuild) {
+      submission.committed = true;
+      auto commit = impl_->state.authoritative.find(record.id);
+      if (commit != impl_->state.authoritative.end()) {
+        auto found = impl_->state.commits.find(commit->second);
+        if (found != impl_->state.commits.end()) submission.commit = found->second;
+      }
+      submission.detail = "served from the authoritative commit record";
+      result.served_from_cache = true;
+      result.units.push_back(std::move(submission));
+      continue;
     }
 
     record.state = CompilationState::Pending;
@@ -745,6 +761,57 @@ void Coordinator::Impl::schedule_retry_or_fail(CompilationRecord& compilation, E
     if (klass == FailureClass::Ambiguous) compilation.state = CompilationState::Ambiguous;
   }
   compilation.updated_at = now();
+  propagate_fan_in_failure(compilation.id);
+}
+
+// A link unit may only commit when every mandatory child is authoritative. The
+// converse also has to hold: when a mandatory child can never become
+// authoritative, the parent must fail rather than wait forever for a gate that
+// will never open.
+void Coordinator::Impl::propagate_fan_in_failure(CompilationId failed) {
+  for (auto& job_kv : state.jobs) {
+    JobRecord& job = job_kv.second;
+    const CompilationRequest* request = find_request(job.request_identity);
+    if (request == nullptr) continue;
+    for (CompilationId unit_id : job.units) {
+      if (unit_id.is_zero() || unit_id == failed) continue;
+      auto parent = state.compilations.find(unit_id);
+      if (parent == state.compilations.end()) continue;
+      if (parent->second.state == CompilationState::Committed ||
+          parent->second.state == CompilationState::CacheHit ||
+          parent->second.state == CompilationState::Failed ||
+          parent->second.state == CompilationState::Cancelled) {
+        continue;
+      }
+      const CompilationUnitSpec* unit = request->find_unit(parent->second.unit_index);
+      if (unit == nullptr || unit->kind != UnitKind::Link) continue;
+      bool depends = false;
+      for (std::uint32_t child : unit->child_units) {
+        if (child < job.units.size() && job.units[child] == failed) depends = true;
+      }
+      if (!depends || !unit->mandatory) continue;
+      auto child_record = state.compilations.find(failed);
+      if (child_record == state.compilations.end()) continue;
+      const CompilationState child_state = child_record->second.state;
+      if (child_state != CompilationState::Failed && child_state != CompilationState::Cancelled &&
+          child_state != CompilationState::Ambiguous && child_state != CompilationState::Fenced) {
+        continue;
+      }
+      parent->second.state = CompilationState::Failed;
+      parent->second.failure = ErrorCode::FanInIncomplete;
+      parent->second.failure_detail = "mandatory child compilation " + std::to_string(failed.value()) +
+                                      " cannot become authoritative (state " +
+                                      std::string(to_string(child_state)) + ")";
+      parent->second.updated_at = now();
+      std::vector<std::byte> payload = encode_compilation_payload(parent->second);
+      (void)persist(RecordType::Compilation, payload);
+      job.failure = ErrorCode::FanInIncomplete;
+      job.failure_detail = parent->second.failure_detail;
+      std::vector<std::byte> job_payload;
+      detail::encode_job_record(job, job_payload);
+      (void)persist(RecordType::Job, job_payload);
+    }
+  }
 }
 
 Status Coordinator::fail_attempt(SessionId session_id, const AttemptFailure& failure) {
@@ -876,6 +943,243 @@ Status Coordinator::cancel(CompilationId id, const std::string& reason) {
   record.updated_at = impl_->now();
   std::vector<std::byte> payload = encode_compilation_payload(record);
   return impl_->persist(RecordType::Compilation, payload);
+}
+
+// ---------------------------------------------------------------------------
+// Worker lifecycle
+// ---------------------------------------------------------------------------
+Result<RegisteredWorker> Coordinator::register_worker(const WorkerRegistration& registration) {
+  std::lock_guard<std::mutex> guard(impl_->mutex);
+  Status open_status = impl_->ensure_open();
+  if (!open_status.ok()) return Result<RegisteredWorker>(open_status);
+  if (registration.worker_id.is_zero() || registration.boot_id.is_zero()) {
+    return Result<RegisteredWorker>(
+        Status::error(ErrorCode::InvalidArgument, "worker id and boot id are required"));
+  }
+  WorkerCapabilities capabilities = registration.capabilities;
+  if (capabilities.toolchains.size() > 64 || capabilities.targets.size() > 64 ||
+      capabilities.input_formats.size() > 64 || capabilities.plugins.size() > 256 ||
+      capabilities.sdks.size() > 64) {
+    return Result<RegisteredWorker>(
+        Status::error(ErrorCode::LimitExceeded, "worker capability advertisement exceeds bounds"));
+  }
+  canonicalize(capabilities);
+  if (capabilities.host.empty()) capabilities.host = registration.host;
+
+  if (impl_->state.workers.size() >= impl_->config.max_workers &&
+      impl_->state.workers.count(registration.worker_id) == 0) {
+    return Result<RegisteredWorker>(Status::error(ErrorCode::LimitExceeded, "worker table is full"));
+  }
+
+  WorkerRecord* existing = impl_->find_worker(registration.worker_id);
+  WorkerRecord worker;
+  WorkerGeneration generation(1);
+  if (existing != nullptr) {
+    worker = *existing;
+    // A fresh boot always gets a fresh generation. Reconnecting with the same
+    // boot id still advances the generation, so authority bound to the previous
+    // generation can never be inherited.
+    generation = worker.generation.is_zero() ? WorkerGeneration(1) : worker.generation.next();
+  } else {
+    worker.id = registration.worker_id;
+  }
+
+  worker.boot = registration.boot_id;
+  worker.generation = generation;
+  worker.session = SessionId(impl_->state.header.next_session_id++);
+  worker.endpoint = registration.endpoint;
+  worker.host = registration.host.empty() ? capabilities.host : registration.host;
+  worker.capabilities = capabilities;
+  worker.capabilities.host = worker.host;
+  worker.health = capabilities.evidence == EvidenceClass::Unknown ? WorkerHealth::Unknown : WorkerHealth::Healthy;
+  worker.ready = false;
+  worker.fenced = false;
+  worker.in_flight = 0;
+  worker.queue_depth = 0;
+  worker.active_leases.clear();
+  worker.registered_at = impl_->now();
+  worker.last_seen = worker.registered_at;
+  worker.trusted_evidence_fresh = capabilities.evidence == EvidenceClass::Real;
+
+  detail::SessionRecord session;
+  session.id = worker.session;
+  session.is_worker = true;
+  session.worker = worker.id;
+  session.boot = worker.boot;
+  session.epoch = impl_->state.header.epoch;
+  session.peer = registration.endpoint;
+  session.host = worker.host;
+  session.connected_at = worker.registered_at;
+  session.last_seen = worker.registered_at;
+  session.open = true;
+  session.max_inflight = std::max<std::uint32_t>(1, std::min<std::uint32_t>(registration.max_inflight, 64));
+  impl_->state.sessions[session.id] = session;
+  impl_->state.workers[worker.id] = worker;
+
+  std::vector<std::byte> payload = encode_worker_payload(worker);
+  Status persist_status = impl_->persist_entity(RecordType::Worker, payload);
+  if (!persist_status.ok()) return Result<RegisteredWorker>(persist_status);
+
+  RegisteredWorker registered;
+  registered.session = worker.session;
+  registered.worker = worker.id;
+  registered.boot = worker.boot;
+  registered.generation = worker.generation;
+  registered.epoch = impl_->state.header.epoch;
+  registered.detail = existing != nullptr ? "reconnect with a fresh boot identity" : "admitted";
+  return Result<RegisteredWorker>(registered);
+}
+
+Status Coordinator::advertise_capabilities(SessionId session_id, const WorkerCapabilities& capabilities) {
+  std::lock_guard<std::mutex> guard(impl_->mutex);
+  Status open_status = impl_->ensure_open();
+  if (!open_status.ok()) return open_status;
+  const detail::SessionRecord* session = impl_->find_session(session_id);
+  if (session == nullptr || !session->is_worker) {
+    return Status::error(ErrorCode::Unauthorized, "session is not a worker session");
+  }
+  WorkerRecord* worker = impl_->find_worker(session->worker);
+  if (worker == nullptr) return Status::error(ErrorCode::NotFound, "unknown worker");
+  if (worker->boot != session->boot) {
+    impl_->record_violation("advertise_capabilities", ErrorCode::StaleWorkerBoot, session_id, session->worker,
+                            "capability advertisement from a superseded boot");
+    return Status::error(ErrorCode::StaleWorkerBoot, "worker boot identity has been superseded");
+  }
+  WorkerCapabilities updated = capabilities;
+  canonicalize(updated);
+  updated.host = worker->host;
+  worker->capabilities = updated;
+  worker->health = updated.evidence == EvidenceClass::Unknown ? WorkerHealth::Unknown : WorkerHealth::Healthy;
+  worker->trusted_evidence_fresh = updated.evidence == EvidenceClass::Real;
+  worker->last_seen = impl_->now();
+  std::vector<std::byte> payload = encode_worker_payload(*worker);
+  return impl_->persist_entity(RecordType::Worker, payload);
+}
+
+Status Coordinator::mark_ready(SessionId session_id) {
+  std::lock_guard<std::mutex> guard(impl_->mutex);
+  Status open_status = impl_->ensure_open();
+  if (!open_status.ok()) return open_status;
+  const detail::SessionRecord* session = impl_->find_session(session_id);
+  if (session == nullptr || !session->is_worker) {
+    return Status::error(ErrorCode::Unauthorized, "session is not a worker session");
+  }
+  WorkerRecord* worker = impl_->find_worker(session->worker);
+  if (worker == nullptr) return Status::error(ErrorCode::NotFound, "unknown worker");
+  if (worker->boot != session->boot) {
+    return Status::error(ErrorCode::StaleWorkerBoot, "worker boot identity has been superseded");
+  }
+  if (worker->capabilities.evidence == EvidenceClass::Unknown) {
+    // A worker with no capability evidence may not become ready: eligibility
+    // would then be decided on UNKNOWN, which fails closed anyway, and a
+    // "ready" label without evidence would be a lie.
+    return Status::error(ErrorCode::Unknown,
+                         "worker cannot become ready without evidence-backed capabilities");
+  }
+  worker->ready = true;
+  worker->health = WorkerHealth::Healthy;
+  worker->last_seen = impl_->now();
+  std::vector<std::byte> payload = encode_worker_payload(*worker);
+  return impl_->persist(RecordType::Worker, payload);
+}
+
+Status Coordinator::heartbeat(SessionId session_id) {
+  std::lock_guard<std::mutex> guard(impl_->mutex);
+  Status open_status = impl_->ensure_open();
+  if (!open_status.ok()) return open_status;
+  detail::SessionRecord* session = nullptr;
+  auto found = impl_->state.sessions.find(session_id);
+  if (found != impl_->state.sessions.end()) session = &found->second;
+  if (session == nullptr || !session->open) {
+    return Status::error(ErrorCode::StaleSession, "session is not open at this epoch");
+  }
+  session->last_seen = impl_->now();
+  if (session->is_worker) {
+    WorkerRecord* worker = impl_->find_worker(session->worker);
+    if (worker == nullptr) return Status::error(ErrorCode::NotFound, "unknown worker");
+    if (worker->boot != session->boot) {
+      return Status::error(ErrorCode::StaleWorkerBoot, "worker boot identity has been superseded");
+    }
+    worker->last_seen = session->last_seen;
+    if (worker->health == WorkerHealth::Suspect) worker->health = WorkerHealth::Healthy;
+  }
+  return Status::success();
+}
+
+Status Coordinator::begin_compile(const AuthorityClaim& claim) {
+  std::lock_guard<std::mutex> guard(impl_->mutex);
+  Status open_status = impl_->ensure_open();
+  if (!open_status.ok()) return open_status;
+
+  auto attempt = impl_->state.attempts.find(claim.attempt);
+  if (attempt == impl_->state.attempts.end()) {
+    impl_->record_violation("begin_compile", ErrorCode::StaleAttempt, SessionId(0), WorkerId(0),
+                            "begin for an unknown attempt");
+    return Status::error(ErrorCode::StaleAttempt, "unknown attempt");
+  }
+  auto compilation = impl_->state.compilations.find(claim.compilation);
+  if (compilation == impl_->state.compilations.end()) {
+    return Status::error(ErrorCode::StaleCompilation, "unknown compilation");
+  }
+  const AuthorityExpectation expected = impl_->expectation_for(compilation->second, attempt->second);
+  Status authority = validate_authority(claim, expected);
+  if (!authority.ok()) {
+    impl_->record_violation("begin_compile", authority.code(), SessionId(0), attempt->second.worker,
+                            authority.detail());
+    return authority;
+  }
+  CompilationAttempt& target = attempt->second;
+  if (target.state != AttemptState::Assigned && target.state != AttemptState::Preparing &&
+      target.state != AttemptState::Running) {
+    return Status::error(ErrorCode::StaleAttempt,
+                         "attempt is in state " + std::string(to_string(target.state)));
+  }
+  if (target.state == AttemptState::Assigned) {
+    Status moved = impl_->transition_attempt(target, AttemptState::Preparing);
+    if (!moved.ok()) return moved;
+    target.started_at = impl_->now();
+    compilation->second.state = CompilationState::Running;
+    compilation->second.updated_at = target.started_at;
+  }
+  std::vector<std::byte> payload = encode_attempt_payload(target);
+  Status persist_status = impl_->persist(RecordType::Attempt, payload);
+  if (!persist_status.ok()) return persist_status;
+  payload = encode_compilation_payload(compilation->second);
+  return impl_->persist(RecordType::Compilation, payload);
+}
+
+Status Coordinator::handle_validate_response(SessionId session_id, std::uint32_t mode,
+                                              EvidenceClass evidence, const Digest256& capabilities_digest,
+                                              const std::string& detail) {
+  std::lock_guard<std::mutex> guard(impl_->mutex);
+  Status open_status = impl_->ensure_open();
+  if (!open_status.ok()) return open_status;
+  const detail::SessionRecord* session = impl_->find_session(session_id);
+  if (session == nullptr || !session->is_worker) {
+    return Status::error(ErrorCode::Unauthorized, "session is not a worker session");
+  }
+  WorkerRecord* worker = impl_->find_worker(session->worker);
+  if (worker == nullptr) return Status::error(ErrorCode::NotFound, "unknown worker");
+  if (worker->boot != session->boot) {
+    // A response from a superseded boot proves nothing about the live worker.
+    return Status::error(ErrorCode::StaleWorkerBoot, "validate response from a superseded boot");
+  }
+  if (mode != 0) return Status::success();
+  if (capabilities_digest != worker->capabilities.digest) {
+    // The toolchain the worker can actually see has changed since it
+    // registered. Its old advertisement is not evidence of the current state.
+    worker->trusted_evidence_fresh = false;
+    worker->ready = false;
+    worker->health = WorkerHealth::Suspect;
+    impl_->record_violation("validate_output", ErrorCode::StaleToolchain, session_id, worker->id,
+                            "evidence revalidation produced a different capability digest: " + detail);
+    std::vector<std::byte> payload = encode_worker_payload(*worker);
+    return impl_->persist(RecordType::Worker, payload);
+  }
+  worker->trusted_evidence_fresh = evidence == EvidenceClass::Real;
+  worker->last_seen = impl_->now();
+  std::vector<std::byte> payload = encode_worker_payload(*worker);
+  return impl_->persist(RecordType::Worker, payload);
 }
 
 Status Coordinator::shutdown_sessions() {
@@ -1228,7 +1532,12 @@ Result<CommitDecision> Coordinator::report_output(SessionId session_id, const Re
   ValidationReport validation = validate_artifact_bytes(
       std::span<const std::byte>(output.bytes.data(), output.bytes.size()), output_kind, target, requirements,
       candidate_digest);
-  if (requirements.require_smoke_test && validation.aggregate == ValidationOutcome::Pass) {
+  // A smoke test executes the artifact, so it is meaningful only for a unit that
+  // produces an executable. Applying a request-level smoke test to an
+  // intermediate object would fail every fan-out job for the wrong reason.
+  const bool executable_output = output_kind == OutputKind::Executable;
+  if (requirements.require_smoke_test && executable_output &&
+      validation.aggregate == ValidationOutcome::Pass) {
     // The smoke test executes the produced binary on the coordinator, which is
     // the only way to prove the artifact is loadable by an independent process.
     Workspace scratch;

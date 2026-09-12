@@ -324,6 +324,7 @@ class Coordinator {
   std::vector<ArtifactCommit> commits() const;
   std::vector<Provenance> provenances() const;
   std::vector<CacheEntry> cache_entries() const;
+  Result<CacheEntry> cache_entry(CacheEntryId id) const;
   std::vector<NegativeCacheEntry> negative_cache_entries() const;
   std::vector<IntermediateArtifact> intermediates() const;
   std::vector<CompileLease> leases() const;
@@ -339,6 +340,10 @@ class Coordinator {
   Status fail_attempt(SessionId session, const AttemptFailure& failure);
   Status disconnect_session(SessionId session, const std::string& reason);
   Status shutdown_sessions();
+  // Answer to VALIDATE_OUTPUT. Re-establishes (or refuses) dynamic evidence for
+  // a worker after a restart, and records the observation.
+  Status handle_validate_response(SessionId session, std::uint32_t mode, EvidenceClass evidence,
+                                  const Digest256& capabilities_digest, const std::string& detail);
 
   // --- scheduling --------------------------------------------------------
   std::vector<Assignment> pump();

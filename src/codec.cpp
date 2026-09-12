@@ -150,7 +150,7 @@ bool decode_toolchain(CanonicalReader& r, ToolchainIdentity& out) {
     if (!r.read_str(value.configuration[i].second)) return false;
   }
   if (!read_enum(r, value.evidence, EvidenceClass::Unsupported)) return false;
-  if (!r.read_id(value.evidence_id)) return false;
+  if (!r.read_optional_id(value.evidence_id)) return false;
   if (!r.read_gen(value.evidence_generation)) return false;
   if (!r.read_digest(value.identity_digest)) return false;
 
@@ -641,7 +641,7 @@ bool decode_worker(CanonicalReader& r, WorkerRecord& out) {
   if (!r.read_id(value.id)) return false;
   if (!r.read_id(value.boot)) return false;
   if (!r.read_gen(value.generation)) return false;
-  if (!r.read_id(value.session)) return false;
+  if (!r.read_optional_id(value.session)) return false;
   if (!r.read_str(value.endpoint)) return false;
   if (!r.read_str(value.host)) return false;
   if (!decode_capabilities(r, value.capabilities)) return false;
@@ -716,7 +716,9 @@ void encode_validation_report(CanonicalWriter& w, const ValidationReport& value)
 
 bool decode_validation_report(CanonicalReader& r, ValidationReport& out) {
   ValidationReport value;
-  if (!r.read_id(value.id)) return false;
+  // A report id of zero means "no validation recorded yet", which is the state
+  // of an attempt that has not produced a candidate.
+  if (!r.read_optional_id(value.id)) return false;
   std::uint32_t count = 0;
   if (!r.read_list(count)) return false;
   if (count > 4096) {
@@ -794,7 +796,7 @@ bool decode_attempt(CanonicalReader& r, CompilationAttempt& out) {
   if (!decode_validation_report(r, value.validation)) return false;
   if (!decode_content_ref(r, value.candidate)) return false;
   if (!r.read_digest(value.candidate_digest)) return false;
-  if (!r.read_id(value.artifact)) return false;
+  if (!r.read_optional_id(value.artifact)) return false;
   if (!r.read_u64(value.compiler_wall_millis)) return false;
   if (!r.read_str(value.compiler_invocation)) return false;
   if (!r.read_str(value.compiler_version_string)) return false;
@@ -1150,7 +1152,7 @@ bool decode_compilation(CanonicalReader& r, CompilationRecord& out) {
   for (std::uint32_t i = 0; i < count; ++i) {
     if (!r.read_id(value.attempts[i])) return false;
   }
-  if (!r.read_id(value.current_attempt)) return false;
+  if (!r.read_optional_id(value.current_attempt)) return false;
   if (!r.read_u32(value.attempt_ordinal_counter)) return false;
   bool has_commit = false;
   if (!r.read_bool(has_commit)) return false;
@@ -1217,7 +1219,7 @@ bool decode_job(CanonicalReader& r, JobRecord& out) {
     if (!r.read_u32(value.mandatory_units[i])) return false;
   }
   if (!r.read_bool(value.committed)) return false;
-  if (!r.read_id(value.committed_unit)) return false;
+  if (!r.read_optional_id(value.committed_unit)) return false;
   std::uint16_t failure = 0;
   if (!r.read_u16(failure)) return false;
   if (failure > static_cast<std::uint16_t>(ErrorCode::Shutdown)) {

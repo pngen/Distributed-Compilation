@@ -96,6 +96,7 @@ struct Coordinator::Impl {
   Status fail_attempt_locked(CompilationAttempt& attempt, ErrorCode code, std::string detail,
                              bool produced_candidate);
   void schedule_retry_or_fail(CompilationRecord& compilation, ErrorCode code, std::string detail);
+  void propagate_fan_in_failure(CompilationId failed);
   Status fence_attempts_of_worker(WorkerId worker, std::string reason);
   void mark_job_progress(CompilationRecord& compilation);
 };

@@ -80,6 +80,9 @@ add_library(dc_core STATIC
   src/state_codec.cpp
   src/coordinator.cpp
   src/coordinator_tx.cpp
+  src/net.cpp
+  src/wire.cpp
+  src/compiler.cpp
 )
 add_library(dc::core ALIAS dc_core)
 
@@ -105,3 +108,58 @@ endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(dc_core PUBLIC Threads::Threads)
+
+# ---------------------------------------------------------------------------
+# Applications
+# ---------------------------------------------------------------------------
+if(DC_BUILD_APPS)
+  add_executable(dc_coordinator apps/dc_coordinator.cpp)
+  add_executable(dc_worker apps/dc_worker.cpp)
+  add_executable(dc_cli
+    apps/dc_cli.cpp
+    apps/dc_cli_proof.cpp
+    apps/dc_cli_demo.cpp
+    apps/dc_cli_cuda.cpp
+  )
+
+  foreach(app dc_coordinator dc_worker dc_cli)
+    target_link_libraries(${app} PRIVATE dc::core dc_warnings)
+    target_include_directories(${app} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+  endforeach()
+
+  # -------------------------------------------------------------------------
+  # Optional CUDA driver probe. The core library never depends on CUDA; this
+  # executable is built only when a toolkit with the driver headers and import
+  # library is present.
+  # -------------------------------------------------------------------------
+  set(DC_CUDA_TOOLKIT_ROOT "" CACHE PATH "CUDA toolkit root used for the optional driver probe")
+  if(NOT DC_CUDA_TOOLKIT_ROOT)
+    if(DEFINED ENV{CUDA_PATH} AND EXISTS "$ENV{CUDA_PATH}/include/cuda.h")
+      set(DC_CUDA_TOOLKIT_ROOT "$ENV{CUDA_PATH}")
+    else()
+      file(GLOB _dc_cuda_candidates "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*")
+      list(SORT _dc_cuda_candidates)
+      list(REVERSE _dc_cuda_candidates)
+      foreach(_candidate IN LISTS _dc_cuda_candidates)
+        if(EXISTS "${_candidate}/include/cuda.h")
+          set(DC_CUDA_TOOLKIT_ROOT "${_candidate}")
+          break()
+        endif()
+      endforeach()
+    endif()
+  endif()
+
+  if(DC_WITH_CUDA STREQUAL "OFF")
+    set(DC_CUDA_TOOLKIT_ROOT "")
+  endif()
+
+  if(DC_CUDA_TOOLKIT_ROOT AND EXISTS "${DC_CUDA_TOOLKIT_ROOT}/include/cuda.h")
+    add_executable(dc_cuda_probe apps/dc_cuda_probe.cpp)
+    target_include_directories(dc_cuda_probe PRIVATE "${DC_CUDA_TOOLKIT_ROOT}/include")
+    target_link_directories(dc_cuda_probe PRIVATE "${DC_CUDA_TOOLKIT_ROOT}/lib/x64")
+    target_link_libraries(dc_cuda_probe PRIVATE cuda dc_warnings)
+    message(STATUS "CUDA probe enabled with toolkit ${DC_CUDA_TOOLKIT_ROOT}")
+  else()
+    message(STATUS "CUDA probe disabled (no toolkit with cuda.h was found)")
+  endif()
+endif()

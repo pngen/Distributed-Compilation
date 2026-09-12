@@ -6,6 +6,7 @@
 #ifndef DC_PROCESS_HPP
 #define DC_PROCESS_HPP
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -29,6 +30,9 @@ struct ProcessSpec {
   bool inherit_environment = false;
   std::uint64_t max_output_bytes = 1ull << 20;
   std::uint32_t timeout_millis = 600000;
+  // When set, the child tree is terminated as soon as the flag becomes true.
+  // This is how a cancelled compile actually stops compiling.
+  const std::atomic<bool>* cancel_flag = nullptr;
 };
 
 struct ProcessResult {

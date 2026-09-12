@@ -81,6 +81,13 @@ struct State {
   std::vector<ControlMessage> controls;
 };
 
+// Drops a worker's capability evidence to UNKNOWN and re-commits the
+// capability digest. Every mutation of a capability set must go through this or
+// through canonicalize(), because the digest is an integrity commitment over
+// the set: a stale digest makes the persisted record fail its own integrity
+// check on the next decode.
+void mark_capabilities_unknown(WorkerRecord& worker);
+
 Status encode_state(const State& state, std::vector<std::byte>& out);
 Status decode_state(std::span<const std::byte> bytes, State& out);
 
