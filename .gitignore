@@ -1,0 +1,34 @@
+# Build trees
+/build/
+/build-*/
+/out/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.lib
+*.exp
+*.dll
+
+# Local runtime state produced by coordinator/worker/CLI runs
+/.dcstate/
+/state/
+*.dcjournal
+*.dcsnapshot
+*.cubin
+*.log
+
+# Editor / OS noise
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
