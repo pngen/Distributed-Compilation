@@ -1138,7 +1138,11 @@ Status Coordinator::begin_compile(const AuthorityClaim& claim) {
     Status moved = impl_->transition_attempt(target, AttemptState::Preparing);
     if (!moved.ok()) return moved;
     target.started_at = impl_->now();
-    compilation->second.state = CompilationState::Running;
+    // Starting a speculative sibling must never drag a compilation that has
+    // already committed back out of Committed.
+    if (compilation->second.state != CompilationState::Committed) {
+      compilation->second.state = CompilationState::Running;
+    }
     compilation->second.updated_at = target.started_at;
   }
   std::vector<std::byte> payload = encode_attempt_payload(target);
@@ -1238,15 +1242,31 @@ Result<CommitDecision> Coordinator::Impl::commit_locked(SessionId session, const
     if (prior != state.commits.end() && !prior->second.superseded) {
       if (prior->second.artifact_digest == artifact_digest) {
         // Equivalent duplicate: the same logical artifact converged. No second
-        // authority is created.
-        Status moved = transition_attempt(attempt, AttemptState::Committed);
-        if (!moved.ok()) return Result<CommitDecision>(moved);
+        // authority is created. The attempt still has to walk the legal
+        // lifecycle, because a duplicate arrives in Produced and Committed is
+        // only reachable from CommitReady.
+        Status moved = Status::success();
+        if (attempt.state == AttemptState::Produced) moved = transition_attempt(attempt, AttemptState::Validating);
+        if (moved.ok() && attempt.state == AttemptState::Validating) {
+          moved = transition_attempt(attempt, AttemptState::CommitReady);
+        }
+        if (moved.ok()) moved = transition_attempt(attempt, AttemptState::Committed);
+        if (!moved.ok()) {
+          (void)fail_attempt_locked(attempt, ErrorCode::IllegalTransition, moved.detail(), true);
+          return Result<CommitDecision>(moved);
+        }
         attempt.failure = ErrorCode::Ok;
         attempt.failure_detail = "deduplicated into authoritative commit " +
                                  std::to_string(prior->second.id.value());
         finish_attempt_bookkeeping(attempt);
         std::vector<std::byte> payload = encode_attempt_payload(attempt);
         (void)persist(RecordType::Attempt, payload);
+        if (compilation.state != CompilationState::Committed) {
+          compilation.state = CompilationState::Committed;
+          compilation.updated_at = now();
+          std::vector<std::byte> restored = encode_compilation_payload(compilation);
+          (void)persist(RecordType::Compilation, restored);
+        }
         decision.outcome = CommitOutcome::Deduplicated;
         decision.commit = prior->second;
         decision.validation = validation;
@@ -1504,7 +1524,13 @@ Result<CommitDecision> Coordinator::report_output(SessionId session_id, const Re
     target_attempt.compiler_wall_millis = output.compiler_wall_millis;
     Status moved = impl_->transition_attempt(target_attempt, AttemptState::Produced);
     if (!moved.ok()) return Result<CommitDecision>(moved);
-    compilation->second.state = CompilationState::Producing;
+    // A compilation that already holds an authoritative commit must not be
+    // dragged backwards by a duplicate report: the reservation only marks work
+    // in progress for a compilation that has not committed yet.
+    if (compilation->second.state != CompilationState::Committed &&
+        impl_->state.authoritative.count(compilation->second.id) == 0) {
+      compilation->second.state = CompilationState::Producing;
+    }
     compilation->second.updated_at = impl_->now();
 
     const CompilationRequest* request = impl_->find_request(compilation->second.request_identity);

@@ -96,6 +96,13 @@ RunOutcome compile_kernel(Coordinator& coordinator, const ToolchainIdentity& too
     outcome.status = Status::error(ErrorCode::NoEligibleWorker, "no assignment was produced");
     return outcome;
   }
+  // Mirror the worker protocol: the lease must be acknowledged before a result
+  // may be reported.
+  Status begun = coordinator.begin_compile(chosen->claim);
+  if (!begun.ok()) {
+    outcome.status = begun;
+    return outcome;
+  }
   auto compiled = run_compile_unit(*chosen, toolchain, scratch, nullptr);
   if (!compiled.ok()) {
     outcome.status = compiled.status();

@@ -284,14 +284,26 @@ ValidationReport validate_artifact_bytes(std::span<const std::byte> bytes, Outpu
     push("format", format_ok ? ValidationOutcome::Pass : ValidationOutcome::Fail, std::move(detail));
   }
 
-  if (requirements.require_target_metadata && probe.recognized) {
-    std::string detail;
-    const bool matches = machine_matches_target(probe, target, detail);
-    push("target_metadata", matches ? ValidationOutcome::Pass : ValidationOutcome::Fail,
-         matches ? probe.description : detail);
-  } else if (requirements.require_target_metadata) {
-    push("target_metadata", ValidationOutcome::Unknown,
-         "artifact format was not recognised, so target metadata could not be checked");
+  if (requirements.require_target_metadata) {
+    // Target metadata can only be checked where the format carries it. A text
+    // output (assembly or preprocessed source) has no embedded machine field, so
+    // the check is not applicable rather than unknown -- and the difference is
+    // stated in the evidence. An unrecognised binary format, by contrast, is a
+    // genuine UNKNOWN and fails closed.
+    const bool carries_no_machine_field =
+        kind == OutputKind::Assembly || kind == OutputKind::PreprocessedSource;
+    if (carries_no_machine_field) {
+      push("target_metadata", ValidationOutcome::Pass,
+           "not applicable: text output carries no embedded target metadata");
+    } else if (probe.recognized) {
+      std::string detail;
+      const bool matches = machine_matches_target(probe, target, detail);
+      push("target_metadata", matches ? ValidationOutcome::Pass : ValidationOutcome::Fail,
+           matches ? probe.description : detail);
+    } else {
+      push("target_metadata", ValidationOutcome::Unknown,
+           "artifact format was not recognised, so target metadata could not be checked");
+    }
   }
 
   if (requirements.require_dependency_metadata) {

@@ -1170,10 +1170,23 @@ AuditReport Coordinator::audit() const {
     for (CompilationAttemptId attempt_id : record.attempts) {
       auto attempt = state.attempts.find(attempt_id);
       if (attempt == state.attempts.end()) continue;
+      // A sibling attempt may legitimately still hold a live lease after the
+      // winner commits: it is cancelled and its next report is refused. What
+      // must never exist is authority that is *stale* -- bound to a superseded
+      // epoch, a superseded worker boot, or a fenced worker.
       if (holds_commit_authority(attempt->second.state) && attempt->second.id != commit->second.attempt) {
-        add("no_stale_authority_after_commit",
-            "attempt " + std::to_string(attempt_id.value()) + " still holds commit authority",
-            kv.first);
+        const WorkerRecord* owner = impl_->find_worker(attempt->second.worker);
+        const bool stale_epoch = attempt->second.epoch != state.header.epoch;
+        const bool stale_boot = owner == nullptr || owner->boot != attempt->second.worker_boot;
+        const bool stale_generation =
+            owner == nullptr || owner->generation != attempt->second.worker_generation;
+        const bool fenced_owner = owner == nullptr || owner->fenced;
+        if (stale_epoch || stale_boot || stale_generation || fenced_owner) {
+          add("no_stale_authority_after_commit",
+              "attempt " + std::to_string(attempt_id.value()) +
+                  " holds commit authority from a superseded epoch, boot or worker generation",
+              kv.first);
+        }
       }
       if (attempt->second.state == AttemptState::Cancelled) {
         const WorkerRecord* worker = impl_->find_worker(attempt->second.worker);

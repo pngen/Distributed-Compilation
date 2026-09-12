@@ -1,0 +1,15 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+if(WIN32)
+  # The core uses the platform socket API directly and therefore needs the
+  # Winsock import library at link time.
+  set(_dc_ws2_32_was "${DC_WS2_32_LINKED}")
+  set(DC_WS2_32_LINKED TRUE)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/DistributedCompilationTargets.cmake")
+
+check_required_components(DistributedCompilation)

@@ -29,39 +29,44 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # ---------------------------------------------------------------------------
-# Warnings: zero first-party warnings at /W4 /WX (MSVC) or -Wall -Wextra (GCC/Clang)
+# Build settings: zero first-party warnings at /W4 /WX (MSVC) or -Wall -Wextra.
+# Flags are applied directly to first-party targets rather than
+# through an interface library, so the exported package never depends on a
+# private helper target.
 # ---------------------------------------------------------------------------
-add_library(dc_warnings INTERFACE)
-if(MSVC)
-  target_compile_options(dc_warnings INTERFACE
-    /W4 /permissive- /utf-8 /Zc:__cplusplus /EHsc /MP
-    /wd4127  # conditional expression is constant (used deliberately in templates)
-    /wd4324  # structure was padded due to alignment specifier
-  )
-  if(DC_WARNINGS_AS_ERRORS)
-    target_compile_options(dc_warnings INTERFACE /WX)
-  endif()
-  target_compile_definitions(dc_warnings INTERFACE
-    _CRT_SECURE_NO_WARNINGS
-    NOMINMAX
-    WIN32_LEAN_AND_MEAN
-  )
-else()
-  target_compile_options(dc_warnings INTERFACE -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion)
-  if(DC_WARNINGS_AS_ERRORS)
-    target_compile_options(dc_warnings INTERFACE -Werror)
-  endif()
-endif()
-
-if(DC_ENABLE_ASAN)
+function(dc_apply_build_settings target)
   if(MSVC)
-    target_compile_options(dc_warnings INTERFACE /fsanitize=address /Oy- /Zi)
-    target_link_options(dc_warnings INTERFACE /INCREMENTAL:NO)
+    target_compile_options(${target} PRIVATE
+      /W4 /permissive- /utf-8 /Zc:__cplusplus /EHsc /MP
+      /wd4127  # conditional expression is constant (used deliberately in templates)
+      /wd4324  # structure was padded due to alignment specifier
+    )
+    if(DC_WARNINGS_AS_ERRORS)
+      target_compile_options(${target} PRIVATE /WX)
+    endif()
+    target_compile_definitions(${target} PRIVATE
+      _CRT_SECURE_NO_WARNINGS
+      NOMINMAX
+      WIN32_LEAN_AND_MEAN
+    )
   else()
-    target_compile_options(dc_warnings INTERFACE -fsanitize=address -fno-omit-frame-pointer -g)
-    target_link_options(dc_warnings INTERFACE -fsanitize=address)
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion)
+    if(DC_WARNINGS_AS_ERRORS)
+      target_compile_options(${target} PRIVATE -Werror)
+    endif()
   endif()
-endif()
+
+  if(DC_ENABLE_ASAN)
+    if(MSVC)
+      # /DEBUG gives the ASan runtime symbols to report with.
+      target_compile_options(${target} PRIVATE /fsanitize=address /Oy- /Zi)
+      target_link_options(${target} PRIVATE /INCREMENTAL:NO /DEBUG)
+    else()
+      target_compile_options(${target} PRIVATE -fsanitize=address -fno-omit-frame-pointer -g)
+      target_link_options(${target} PRIVATE -fsanitize=address)
+    endif()
+  endif()
+endfunction()
 
 # ---------------------------------------------------------------------------
 # Core library
@@ -92,11 +97,14 @@ target_include_directories(dc_core
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-target_link_libraries(dc_core PRIVATE dc_warnings)
+dc_apply_build_settings(dc_core)
 target_compile_features(dc_core PUBLIC cxx_std_20)
 set_target_properties(dc_core PROPERTIES
   OUTPUT_NAME "distributedcompilation"
   POSITION_INDEPENDENT_CODE ON
+  # The installed package must expose the same namespaced name that the build
+  # tree uses, so a consumer links dc::core in both cases.
+  EXPORT_NAME core
 )
 
 if(WIN32)
@@ -108,6 +116,52 @@ endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(dc_core PUBLIC Threads::Threads)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+if(DC_BUILD_TESTS)
+  enable_testing()
+  add_library(dc_test_support INTERFACE)
+  target_include_directories(dc_test_support INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+
+  function(dc_add_test name source)
+    add_executable(${name} ${source})
+    target_link_libraries(${name} PRIVATE dc::core dc_test_support)
+    dc_apply_build_settings(${name})
+    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES TIMEOUT 900)
+    if(ARGC GREATER 2)
+      set_tests_properties(${name} PROPERTIES LABELS "${ARGV2}")
+    endif()
+  endfunction()
+
+  dc_add_test(dc_tests_core tests/test_core.cpp unit)
+  dc_add_test(dc_tests_property tests/test_property.cpp property)
+  dc_add_test(dc_tests_concurrency tests/test_concurrency.cpp concurrency)
+  dc_add_test(dc_tests_adversarial tests/test_adversarial.cpp adversarial)
+endif()
+
+# ---------------------------------------------------------------------------
+# Examples and benchmarks
+# ---------------------------------------------------------------------------
+if(DC_BUILD_EXAMPLES)
+  foreach(example example_identity example_transaction example_inspection)
+    add_executable(dc_${example} examples/${example}.cpp)
+    target_link_libraries(dc_${example} PRIVATE dc::core)
+    dc_apply_build_settings(dc_${example})
+    target_include_directories(dc_${example} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+  endforeach()
+endif()
+
+if(DC_BUILD_BENCHMARKS)
+  add_executable(dc_bench benchmarks/dc_bench.cpp)
+  target_link_libraries(dc_bench PRIVATE dc::core)
+  dc_apply_build_settings(dc_bench)
+  target_include_directories(dc_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+endif()
 
 # ---------------------------------------------------------------------------
 # Applications
@@ -123,7 +177,8 @@ if(DC_BUILD_APPS)
   )
 
   foreach(app dc_coordinator dc_worker dc_cli)
-    target_link_libraries(${app} PRIVATE dc::core dc_warnings)
+    target_link_libraries(${app} PRIVATE dc::core)
+    dc_apply_build_settings(${app})
     target_include_directories(${app} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
   endforeach()
 
@@ -157,9 +212,11 @@ if(DC_BUILD_APPS)
     add_executable(dc_cuda_probe apps/dc_cuda_probe.cpp)
     target_include_directories(dc_cuda_probe PRIVATE "${DC_CUDA_TOOLKIT_ROOT}/include")
     target_link_directories(dc_cuda_probe PRIVATE "${DC_CUDA_TOOLKIT_ROOT}/lib/x64")
-    target_link_libraries(dc_cuda_probe PRIVATE cuda dc_warnings)
+    target_link_libraries(dc_cuda_probe PRIVATE cuda)
+    dc_apply_build_settings(dc_cuda_probe)
     message(STATUS "CUDA probe enabled with toolkit ${DC_CUDA_TOOLKIT_ROOT}")
   else()
     message(STATUS "CUDA probe disabled (no toolkit with cuda.h was found)")
   endif()
 endif()
+include(cmake/install-rules.cmake)
