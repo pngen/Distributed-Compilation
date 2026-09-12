@@ -8,7 +8,18 @@
 #include <cstring>
 
 namespace dc {
+
+// Derives a 64-bit handle from the leading bytes of a digest. Handles are never
+// used for content comparison, only as registry keys and record identifiers.
+std::uint64_t handle_from_digest64(const Digest256& digest) noexcept {
+  std::uint64_t raw = 0;
+  std::memcpy(&raw, digest.data(), sizeof(raw));
+  return raw;
+}
+
 namespace {
+
+inline std::uint64_t handle_from_digest(const Digest256& digest) { return handle_from_digest64(digest); }
 
 std::string trim(std::string_view text) {
   std::size_t begin = 0;
@@ -16,14 +27,6 @@ std::string trim(std::string_view text) {
   while (begin < end && std::isspace(static_cast<unsigned char>(text[begin])) != 0) ++begin;
   while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) --end;
   return std::string(text.substr(begin, end - begin));
-}
-
-// Derives a 64-bit handle from the leading bytes of a digest. Handles are
-// never used for content comparison, only as registry keys.
-std::uint64_t handle_from_digest(const Digest256& digest) {
-  std::uint64_t raw = 0;
-  std::memcpy(&raw, digest.data(), sizeof(raw));
-  return raw;
 }
 
 bool contains_control(std::string_view text) {
@@ -817,6 +820,20 @@ Digest256 compute_toolchain_identity(const ToolchainIdentity& toolchain) {
   }
   w.u8(static_cast<std::uint8_t>(toolchain.evidence));
   return w.hash();
+}
+
+CompilationId derive_compilation_id(const Digest256& unit_identity) {
+  CanonicalWriter w;
+  w.domain("dc.compilation-id.v1");
+  w.digest(unit_identity);
+  return CompilationId(mix64(handle_from_digest64(w.hash())));
+}
+
+CompilationUnitId derive_unit_handle(const Digest256& unit_identity) {
+  CanonicalWriter w;
+  w.domain("dc.unit-handle.v1");
+  w.digest(unit_identity);
+  return CompilationUnitId(mix64(handle_from_digest64(w.hash())));
 }
 
 // ---------------------------------------------------------------------------

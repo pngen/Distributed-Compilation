@@ -475,6 +475,15 @@ class GenerationRegistry {
   const std::map<IdT, Slot>& slots() const noexcept { return slots_; }
   void clear() { slots_.clear(); }
 
+  // Restores a (content, generation) pair during recovery. The current
+  // generation is advanced to the highest restored value.
+  void restore(const IdT& id, const Digest256& content, GenT generation) {
+    Slot& slot = slots_[id];
+    if (!slot.by_content.count(content)) slot.order.push_back(content);
+    slot.by_content[content] = generation;
+    if (generation > slot.current) slot.current = generation;
+  }
+
  private:
   std::size_t history_limit_;
   std::map<IdT, Slot> slots_;

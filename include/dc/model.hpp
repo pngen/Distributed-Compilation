@@ -451,6 +451,13 @@ SourceId derive_source_id(std::string_view logical_name);
 IRId derive_ir_id(std::string_view logical_name, InputFormat format);
 CompilePolicyId derive_policy_id(const CompilePolicy& policy);
 
+// The logical compilation identity of one unit is the content identity of that
+// unit. Two identical units in one job intentionally collapse onto one logical
+// compilation; that is deduplication, not an identity collision.
+CompilationId derive_compilation_id(const Digest256& unit_identity);
+CompilationUnitId derive_unit_handle(const Digest256& unit_identity);
+std::uint64_t handle_from_digest64(const Digest256& digest) noexcept;
+
 Digest256 compute_toolchain_identity(const ToolchainIdentity& toolchain);
 Digest256 compute_target_identity(const TargetIdentity& target);
 Digest256 compute_specialization_identity(const SpecializationSpec& spec);
@@ -548,6 +555,7 @@ struct ArtifactCommit {
   CompilationAttemptId attempt;
   UnixMillis committed_at = 0;
   bool deduplicated = false;      // a redundant equivalent candidate converged here
+  bool superseded = false;        // replaced by an explicitly forced rebuild
 };
 
 // ---------------------------------------------------------------------------

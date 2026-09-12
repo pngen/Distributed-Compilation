@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.png binary
+*.cubin binary
+*.lib binary
+*.exe binary

@@ -73,6 +73,13 @@ add_library(dc_core STATIC
   src/canonical.cpp
   src/model.cpp
   src/runtime.cpp
+  src/codec.cpp
+  src/persistence.cpp
+  src/process.cpp
+  src/validate.cpp
+  src/state_codec.cpp
+  src/coordinator.cpp
+  src/coordinator_tx.cpp
 )
 add_library(dc::core ALIAS dc_core)
 
