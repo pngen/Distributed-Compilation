@@ -397,7 +397,16 @@ int run_demo_command(const Arguments& arguments, const std::string& scenario) {
   const std::filesystem::path state_dir = root / "state";
   const std::filesystem::path scratch_alpha = root / "scratch-alpha";
   const std::filesystem::path scratch_beta = root / "scratch-beta";
-  const std::filesystem::path claim_log = root / "alpha-claims.log";
+  // Claims are captured from every worker: which worker receives a given unit
+  // is a ranking decision, so a single worker's log would make the stale-claim
+  // replay depend on scheduling.
+  const std::filesystem::path claim_log_alpha = root / "alpha-claims.log";
+  const std::filesystem::path claim_log_beta = root / "beta-claims.log";
+  const auto read_any_claim = [&]() -> std::string {
+    const std::string alpha_claims = read_text_file(claim_log_alpha);
+    if (!alpha_claims.empty()) return alpha_claims;
+    return read_text_file(claim_log_beta);
+  };
   const std::filesystem::path coordinator_log = root / "coordinator.log";
 
   std::string endpoint;
@@ -429,11 +438,13 @@ int run_demo_command(const Arguments& arguments, const std::string& scenario) {
                                      "--log", (root / (name + ".log")).string()};
     if (with_claim_log) {
       args.push_back("--claim-log");
-      args.push_back(claim_log.string());
+      args.push_back((name == "alpha" ? claim_log_alpha : claim_log_beta).string());
     }
     if (verbose) args.push_back("--verbose");
     if (!worker.start(worker_exe, args)) return false;
-    return worker.wait_ready("DC_WORKER_REGISTERED", 90000);
+    // Registration includes toolchain discovery, which digests real compiler
+    // binaries, so the budget is generous rather than tight.
+    return worker.wait_ready("DC_WORKER_REGISTERED", 240000);
   };
 
   const auto stop_all = [&]() {
@@ -453,12 +464,15 @@ int run_demo_command(const Arguments& arguments, const std::string& scenario) {
   harness.begin("two workers register and advertise real toolchains");
   harness.phase("REGISTER");
   const bool alpha_started = start_worker(alpha, "alpha", scratch_alpha, true);
-  const bool beta_started = start_worker(beta, "beta", scratch_beta, false);
+  const bool beta_started = start_worker(beta, "beta", scratch_beta, true);
   const std::string alpha_text = read_text_file(alpha.ready_file);
   alpha_worker_id = field(alpha_text, "worker");
   alpha_boot_id = field(alpha_text, "boot");
   harness.check(alpha_started && beta_started && !alpha_worker_id.empty() && !alpha_boot_id.empty(),
-                "alpha=" + alpha_worker_id + "/" + alpha_boot_id);
+                "alpha started=" + std::string(alpha_started ? "yes" : "no") + " beta started=" +
+                    std::string(beta_started ? "yes" : "no") + " alpha=" + alpha_worker_id + "/" +
+                    alpha_boot_id + " alpha-file=[" + read_text_file(alpha.ready_file) + "] beta-file=[" +
+                    read_text_file(beta.ready_file) + "]");
 
   auto session = Client::connect(endpoint, SessionRole::Client, "demo");
   if (!session.ok()) {
@@ -649,8 +663,8 @@ int run_demo_command(const Arguments& arguments, const std::string& scenario) {
     }
     harness.check(running_seen, running_seen ? "observed an in-flight attempt" : "no in-flight attempt observed");
 
-    const std::string claims = read_text_file(claim_log);
-    harness.check(!claims.empty(), "the worker recorded its authority claim");
+    const std::string claims = read_any_claim();
+    harness.check(!claims.empty(), "the assigned worker recorded its authority claim");
 
     alpha.kill();
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
@@ -663,7 +677,7 @@ int run_demo_command(const Arguments& arguments, const std::string& scenario) {
   harness.begin("a stale completion claim from a restarted boot is refused");
   harness.phase("VERIFY");
   {
-    const std::string claims = read_text_file(claim_log);
+    const std::string claims = read_any_claim();
     const std::uint64_t attempt_id = number_field(claims, "attempt");
     const std::uint64_t compilation_id = number_field(claims, "compilation");
     const std::uint64_t unit_id = number_field(claims, "unit");
@@ -815,7 +829,7 @@ int run_demo_command(const Arguments& arguments, const std::string& scenario) {
   harness.begin("stale claims cannot commit after the restart");
   harness.phase("RECOVER");
   {
-    const std::string claims = read_text_file(claim_log);
+    const std::string claims = read_any_claim();
     const std::uint64_t attempt_id = number_field(claims, "attempt");
     const std::uint64_t compilation_id = number_field(claims, "compilation");
     bool rejected = false;
@@ -870,8 +884,8 @@ int run_demo_command(const Arguments& arguments, const std::string& scenario) {
   harness.begin("workers re-register with fresh boots and new work completes");
   harness.phase("RECOVER");
   {
-    const bool alpha_again = start_worker(alpha, "alpha", scratch_alpha, false);
-    const bool beta_again = start_worker(beta, "beta", scratch_beta, false);
+    const bool alpha_again = start_worker(alpha, "alpha", scratch_alpha, true);
+    const bool beta_again = start_worker(beta, "beta", scratch_beta, true);
     const std::string text = read_text_file(alpha.ready_file);
     const std::string new_boot = field(text, "boot");
     harness.check(alpha_again && beta_again && !new_boot.empty() && new_boot != alpha_boot_id,
